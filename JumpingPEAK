@@ -1,0 +1,1386 @@
+using BepInEx;
+using BepInEx.Logging;
+using HarmonyLib;
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+[BepInPlugin(PluginGUID, PluginName, PluginVersion)]
+public sealed class JumpingPEAK : BaseUnityPlugin
+{
+    public const string PluginGUID = "Sapphire009.JumpingPEAK";
+    public const string PluginName = "JumpingPEAK";
+    public const string PluginVersion = "1.0.0";
+
+    private const string BuildMarker =
+        "FungusJump-R12-BlockUntilStand";
+
+    internal static ManualLogSource ModLogger;
+
+    /*
+     * WASDX가 movementInput을 차단하기 전에
+     * 실제 WASD 입력과 Shift 상태를 저장합니다.
+     */
+    private static readonly Dictionary<int, Vector2>
+        CapturedMovementInputs =
+            new Dictionary<int, Vector2>();
+
+    private static readonly Dictionary<int, bool>
+        CapturedShiftInputs =
+            new Dictionary<int, bool>();
+
+    /*
+     * 캐릭터가 쓰러졌던 기록과
+     * Stand 상태 복귀 대기시간을 관리합니다.
+     */
+    private static readonly Dictionary<int, StandRecoveryState>
+        StandRecoveryStates =
+            new Dictionary<int, StandRecoveryState>();
+
+    /*
+     * 현재 상태값이 정상으로 돌아온 뒤에도
+     * 이 시간 동안 연속해서 정상 상태여야 점프를 허용합니다.
+     *
+     * Falldown 또는 Fellasleep에서 Stand로 전환되는
+     * 물리 안정화 시간을 확보하기 위한 값입니다.
+     */
+    private const float StandConfirmationDuration = 0.35f;
+
+    private const float RagdollControlThreshold = 0.9f;
+
+    private const int MaximumLogCount = 50;
+
+    private static int blockedJumpLogCount;
+    private static int recoveryStartedLogCount;
+    private static int recoveryCompletedLogCount;
+
+    private Harmony harmony;
+
+    private sealed class StandRecoveryState
+    {
+        public bool WaitingForStand;
+
+        public float StableSince =
+            -1f;
+
+        public string LastReason =
+            "Stable";
+    }
+
+    private void Awake()
+    {
+        ModLogger = Logger;
+
+        harmony = new Harmony(PluginGUID);
+        harmony.PatchAll();
+
+        Logger.LogInfo(
+            $"{PluginName} {PluginVersion} loaded. " +
+            $"Build: {BuildMarker}. " +
+            "Jumping is blocked while fallen or asleep. " +
+            "Jumping resumes after the character returns to Stand.");
+    }
+
+    private void OnDestroy()
+    {
+        CharacterMovementJumpRpcPatch.ClearCache();
+
+        CapturedMovementInputs.Clear();
+        CapturedShiftInputs.Clear();
+        StandRecoveryStates.Clear();
+
+        blockedJumpLogCount = 0;
+        recoveryStartedLogCount = 0;
+        recoveryCompletedLogCount = 0;
+
+        if (harmony != null)
+        {
+            harmony.UnpatchSelf();
+            harmony = null;
+        }
+
+        ModLogger = null;
+    }
+
+    internal static bool IsAirportScene()
+    {
+        string sceneName =
+            SceneManager.GetActiveScene().name;
+
+        if (string.IsNullOrEmpty(sceneName))
+        {
+            return false;
+        }
+
+        return sceneName.IndexOf(
+                   "Airport",
+                   StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static Character ResolveCharacter(
+        Component component)
+    {
+        if (component == null)
+        {
+            return null;
+        }
+
+        Character character =
+            component.GetComponent<Character>();
+
+        if (character == null)
+        {
+            character =
+                component.GetComponentInParent<Character>();
+        }
+
+        return character;
+    }
+
+    private static bool IsKeyboardShiftHeld()
+    {
+        return
+            Input.GetKey(KeyCode.LeftShift) ||
+            Input.GetKey(KeyCode.RightShift);
+    }
+
+    private static void StoreInput(
+        CharacterInput characterInput)
+    {
+        if (characterInput == null)
+        {
+            return;
+        }
+
+        int inputId =
+            characterInput.GetInstanceID();
+
+        CapturedMovementInputs[inputId] =
+            Vector2.ClampMagnitude(
+                characterInput.movementInput,
+                1f);
+
+        /*
+         * Sprint Toggle은 Shift 강화로 취급하지 않고
+         * 실제 Shift 키가 눌렸을 때만 저장합니다.
+         */
+        CapturedShiftInputs[inputId] =
+            IsKeyboardShiftHeld();
+    }
+
+    private static Vector2 GetMovementInput(
+        Character character)
+    {
+        if (character == null ||
+            character.input == null)
+        {
+            return Vector2.zero;
+        }
+
+        Vector2 movementInput =
+            character.input.movementInput;
+
+        Vector2 capturedInput;
+
+        if (CapturedMovementInputs.TryGetValue(
+                character.input.GetInstanceID(),
+                out capturedInput))
+        {
+            movementInput =
+                capturedInput;
+        }
+
+        return Vector2.ClampMagnitude(
+            movementInput,
+            1f);
+    }
+
+    private static bool GetShiftHeld(
+        Character character)
+    {
+        if (character == null ||
+            character.input == null)
+        {
+            return false;
+        }
+
+        bool capturedShiftHeld;
+
+        if (CapturedShiftInputs.TryGetValue(
+                character.input.GetInstanceID(),
+                out capturedShiftHeld))
+        {
+            return capturedShiftHeld;
+        }
+
+        return IsKeyboardShiftHeld();
+    }
+
+    /*
+     * Falldown, Fellasleep 또는 Stand 복귀 중인 상태를
+     * 캐릭터의 실제 데이터값으로 판정합니다.
+     */
+    private static bool IsFallOrSleepState(
+        Character character,
+        out string reason)
+    {
+        reason =
+            "Stable";
+
+        if (character == null ||
+            character.data == null)
+        {
+            reason =
+                "MissingCharacterData";
+
+            return true;
+        }
+
+        if (character.data.dead)
+        {
+            reason =
+                "Dead";
+
+            return true;
+        }
+
+        if (character.data.fullyPassedOut)
+        {
+            reason =
+                "FullyPassedOut";
+
+            return true;
+        }
+
+        if (character.data.passedOut)
+        {
+            reason =
+                "PassedOut";
+
+            return true;
+        }
+
+        if (character.data.passedOutOnTheBeach >
+            0f)
+        {
+            reason =
+                "PassedOutOnTheBeach";
+
+            return true;
+        }
+
+        /*
+         * 넘어졌을 때 남아 있는 강제 래그돌 시간입니다.
+         */
+        if (character.data.fallSeconds >
+            0.01f)
+        {
+            reason =
+                "FallSeconds";
+
+            return true;
+        }
+
+        /*
+         * 목표 자세는 Stand지만 실제 몸의 제어가
+         * 아직 충분히 회복되지 않은 상태입니다.
+         */
+        if (character.data.currentRagdollControll <
+            RagdollControlThreshold)
+        {
+            reason =
+                "CurrentRagdollControl";
+
+            return true;
+        }
+
+        /*
+         * 게임 자체가 아직 래그돌 자세를 목표로 하고 있다면
+         * Stand 전환이 시작되지 않은 상태입니다.
+         */
+        if (character.data.GetTargetRagdollControll() <
+            RagdollControlThreshold)
+        {
+            reason =
+                "TargetRagdollControl";
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /*
+     * 매 프레임 현재 캐릭터의 Stand 복귀 상태를 갱신합니다.
+     */
+    private static void UpdateStandRecovery(
+        Character character)
+    {
+        if (character == null ||
+            !character.IsLocal ||
+            character.data == null)
+        {
+            return;
+        }
+
+        int characterId =
+            character.GetInstanceID();
+
+        if (IsAirportScene())
+        {
+            StandRecoveryStates.Remove(
+                characterId);
+
+            return;
+        }
+
+        string fallReason;
+
+        bool fallOrSleepState =
+            IsFallOrSleepState(
+                character,
+                out fallReason);
+
+        StandRecoveryState recoveryState;
+
+        if (!StandRecoveryStates.TryGetValue(
+                characterId,
+                out recoveryState))
+        {
+            if (!fallOrSleepState)
+            {
+                return;
+            }
+
+            recoveryState =
+                new StandRecoveryState();
+
+            StandRecoveryStates.Add(
+                characterId,
+                recoveryState);
+        }
+
+        if (fallOrSleepState)
+        {
+            bool newlyEnteredRecovery =
+                !recoveryState.WaitingForStand;
+
+            recoveryState.WaitingForStand =
+                true;
+
+            recoveryState.StableSince =
+                -1f;
+
+            recoveryState.LastReason =
+                fallReason;
+
+            if (newlyEnteredRecovery &&
+                recoveryStartedLogCount <
+                MaximumLogCount)
+            {
+                recoveryStartedLogCount++;
+
+                ModLogger?.LogInfo(
+                    $"[JumpingPEAK] Stand recovery started " +
+                    $"({recoveryStartedLogCount}/{MaximumLogCount}). " +
+                    $"Reason={fallReason}, " +
+                    $"FallSeconds=" +
+                    $"{character.data.fallSeconds:0.000}, " +
+                    $"PassedOut={character.data.passedOut}, " +
+                    $"CurrentControl=" +
+                    $"{character.data.currentRagdollControll:0.000}, " +
+                    $"TargetControl=" +
+                    $"{character.data.GetTargetRagdollControll():0.000}, " +
+                    $"Scene=" +
+                    $"{SceneManager.GetActiveScene().name}");
+            }
+
+            return;
+        }
+
+        if (!recoveryState.WaitingForStand)
+        {
+            StandRecoveryStates.Remove(
+                characterId);
+
+            return;
+        }
+
+        /*
+         * 모든 래그돌 상태값이 정상으로 돌아온 첫 순간입니다.
+         */
+        if (recoveryState.StableSince < 0f)
+        {
+            recoveryState.StableSince =
+                Time.time;
+
+            return;
+        }
+
+        float stableDuration =
+            Time.time -
+            recoveryState.StableSince;
+
+        /*
+         * Stand 상태가 일정 시간 동안 연속 유지되어야
+         * 점프 차단을 해제합니다.
+         */
+        if (stableDuration <
+            StandConfirmationDuration)
+        {
+            return;
+        }
+
+        string previousReason =
+            recoveryState.LastReason;
+
+        StandRecoveryStates.Remove(
+            characterId);
+
+        if (recoveryCompletedLogCount <
+            MaximumLogCount)
+        {
+            recoveryCompletedLogCount++;
+
+            ModLogger?.LogInfo(
+                $"[JumpingPEAK] Stand recovery completed " +
+                $"({recoveryCompletedLogCount}/{MaximumLogCount}). " +
+                $"PreviousReason={previousReason}, " +
+                $"StableDuration={stableDuration:0.000}, " +
+                $"Scene=" +
+                $"{SceneManager.GetActiveScene().name}");
+        }
+    }
+
+    private static bool ShouldBlockJump(
+        Character character,
+        out string reason)
+    {
+        reason =
+            "Stable";
+
+        if (character == null ||
+            !character.IsLocal ||
+            character.data == null)
+        {
+            return false;
+        }
+
+        if (IsAirportScene())
+        {
+            StandRecoveryStates.Remove(
+                character.GetInstanceID());
+
+            return false;
+        }
+
+        /*
+         * 점프 요청 시에도 상태를 즉시 갱신합니다.
+         * Update보다 먼저 점프 입력이 처리되는 프레임을
+         * 놓치지 않기 위한 처리입니다.
+         */
+        UpdateStandRecovery(
+            character);
+
+        string currentReason;
+
+        if (IsFallOrSleepState(
+                character,
+                out currentReason))
+        {
+            reason =
+                currentReason;
+
+            return true;
+        }
+
+        StandRecoveryState recoveryState;
+
+        if (!StandRecoveryStates.TryGetValue(
+                character.GetInstanceID(),
+                out recoveryState))
+        {
+            return false;
+        }
+
+        if (!recoveryState.WaitingForStand)
+        {
+            return false;
+        }
+
+        if (recoveryState.StableSince < 0f)
+        {
+            reason =
+                "WaitingForStand";
+
+            return true;
+        }
+
+        float stableDuration =
+            Time.time -
+            recoveryState.StableSince;
+
+        if (stableDuration <
+            StandConfirmationDuration)
+        {
+            reason =
+                "StandConfirmation";
+
+            return true;
+        }
+
+        StandRecoveryStates.Remove(
+            character.GetInstanceID());
+
+        return false;
+    }
+
+    private static void LogBlockedJump(
+        Character character,
+        string source,
+        string reason)
+    {
+        if (blockedJumpLogCount >=
+            MaximumLogCount)
+        {
+            return;
+        }
+
+        blockedJumpLogCount++;
+
+        string fallSecondsText =
+            "Unknown";
+
+        string passedOutText =
+            "Unknown";
+
+        string currentControlText =
+            "Unknown";
+
+        string targetControlText =
+            "Unknown";
+
+        if (character != null &&
+            character.data != null)
+        {
+            fallSecondsText =
+                character.data.fallSeconds.ToString(
+                    "0.000");
+
+            passedOutText =
+                character.data.passedOut.ToString();
+
+            currentControlText =
+                character.data.currentRagdollControll.ToString(
+                    "0.000");
+
+            targetControlText =
+                character.data.GetTargetRagdollControll().ToString(
+                    "0.000");
+        }
+
+        ModLogger?.LogInfo(
+            $"[JumpingPEAK] Jump blocked " +
+            $"({blockedJumpLogCount}/{MaximumLogCount}). " +
+            $"Source={source}, " +
+            $"Reason={reason}, " +
+            $"FallSeconds={fallSecondsText}, " +
+            $"PassedOut={passedOutText}, " +
+            $"CurrentControl={currentControlText}, " +
+            $"TargetControl={targetControlText}, " +
+            $"Scene={SceneManager.GetActiveScene().name}");
+    }
+
+    /*
+     * PEAK가 입력을 읽은 직후 실행합니다.
+     *
+     * WASDX가 movementInput을 지우기 전에
+     * 실제 WASD 및 Shift 입력을 보존합니다.
+     */
+    [HarmonyPatch(
+        typeof(CharacterInput),
+        "Sample",
+        new Type[]
+        {
+            typeof(bool)
+        })]
+    private static class CharacterInputSamplePatch
+    {
+        [HarmonyPostfix]
+        [HarmonyPriority(Priority.First)]
+        [HarmonyBefore(
+            new string[]
+            {
+                "Sapphire009.WASDX"
+            })]
+        private static void Postfix(
+            CharacterInput __instance)
+        {
+            StoreInput(
+                __instance);
+        }
+    }
+
+    /*
+     * 입력이 없어도 캐릭터 상태를 매 프레임 추적하여
+     * Falldown/Fellasleep에서 Stand로 돌아온 시점을 확인합니다.
+     */
+    [HarmonyPatch(
+        typeof(CharacterMovement),
+        "Update")]
+    private static class CharacterMovementUpdatePatch
+    {
+        [HarmonyPostfix]
+        private static void Postfix(
+            CharacterMovement __instance)
+        {
+            Character character =
+                ResolveCharacter(
+                    __instance);
+
+            UpdateStandRecovery(
+                character);
+        }
+    }
+
+    /*
+     * 사용자가 직접 점프 키를 누르는 경로입니다.
+     *
+     * 쓰러진 상태에서는 JumpRpc 자체를 보내지 않습니다.
+     */
+    [HarmonyPatch(
+        typeof(CharacterMovement),
+        "TryToJump")]
+    private static class CharacterMovementTryToJumpPatch
+    {
+        [HarmonyPrefix]
+        [HarmonyPriority(Priority.First)]
+        [HarmonyBefore(
+            new string[]
+            {
+                "Sapphire009.BeforeStart",
+                "Sapphire009.NoGround"
+            })]
+        private static bool Prefix(
+            CharacterMovement __instance)
+        {
+            Character character =
+                ResolveCharacter(
+                    __instance);
+
+            if (character == null ||
+                !character.IsLocal ||
+                IsAirportScene())
+            {
+                return true;
+            }
+
+            string reason;
+
+            if (!ShouldBlockJump(
+                    character,
+                    out reason))
+            {
+                return true;
+            }
+
+            /*
+             * 이전 정상 점프에서 jumpImpulse가 강화된 채
+             * 남아 있을 수 있으므로 원본값으로 복구합니다.
+             */
+            CharacterMovementJumpRpcPatch
+                .RestoreOriginalJumpImpulse(
+                    __instance);
+
+            LogBlockedJump(
+                character,
+                "TryToJump",
+                reason);
+
+            return false;
+        }
+    }
+
+    /*
+     * NoGround처럼 TryToJump를 통하지 않고
+     * JumpRpc를 직접 호출하는 점프도 여기서 차단합니다.
+     */
+    [HarmonyPatch(
+        typeof(CharacterMovement),
+        nameof(CharacterMovement.JumpRpc),
+        new Type[]
+        {
+            typeof(bool)
+        })]
+    private static class CharacterMovementJumpRpcPatch
+    {
+        /*
+         * Stand 상태에서 사용하는 기본 고점프 배율입니다.
+         */
+        private const float ControlledJumpMultiplier = 5f;
+
+        /*
+         * Stand 상태에서 Shift를 누른 경우
+         * 기본 고점프의 2배를 적용합니다.
+         *
+         * 일반 점프: 원본 ×5
+         * Shift 점프: 원본 ×10
+         */
+        private const float ShiftBoostMultiplier = 2f;
+
+        private const float DirectionalJumpSpeed = 15f;
+
+        private const float ShiftDirectionalSpeedMultiplier = 2f;
+
+        private const int MaximumTakeoffWaitFrames = 30;
+
+        private static readonly WaitForFixedUpdate
+            WaitForPhysics =
+                new WaitForFixedUpdate();
+
+        private static readonly Dictionary<int, float>
+            OriginalJumpImpulses =
+                new Dictionary<int, float>();
+
+        private static int boostedJumpLogCount;
+        private static int directionalBoostLogCount;
+        private static int defaultJumpLogCount;
+        private static int rejectedLogCount;
+
+        private sealed class JumpPatchState
+        {
+            public Character Character;
+
+            public Vector2 MovementInput =
+                Vector2.zero;
+
+            public Vector3 MovementDirection =
+                Vector3.zero;
+
+            public float DirectionalSpeed;
+
+            public bool ApplyDirectionalBoost;
+
+            public bool ShiftBoosted;
+
+            public bool WasGrounded;
+        }
+
+        [HarmonyPrefix]
+        [HarmonyPriority(Priority.First)]
+        [HarmonyBefore(
+            new string[]
+            {
+                "Sapphire009.NoGround"
+            })]
+        private static bool Prefix(
+            CharacterMovement __instance,
+            bool __0,
+            out JumpPatchState __state)
+        {
+            __state =
+                new JumpPatchState();
+
+            bool isPalJump =
+                __0;
+
+            if (__instance == null)
+            {
+                LogRejected(
+                    "CharacterMovement is null.");
+
+                return true;
+            }
+
+            Character character =
+                ResolveCharacter(
+                    __instance);
+
+            if (character == null)
+            {
+                LogRejected(
+                    "Character could not be resolved.");
+
+                return true;
+            }
+
+            /*
+             * 원격 캐릭터는 해당 플레이어가 보낸
+             * 원본 네트워크 점프를 그대로 재생합니다.
+             */
+            if (!character.IsLocal)
+            {
+                return true;
+            }
+
+            if (character.data == null)
+            {
+                LogRejected(
+                    "Character.data is null.");
+
+                return true;
+            }
+
+            if (character.input == null)
+            {
+                LogRejected(
+                    "Character.input is null.");
+
+                return true;
+            }
+
+            CaptureOriginalJumpImpulse(
+                __instance);
+
+            RestoreOriginalJumpImpulse(
+                __instance);
+
+            float originalJumpImpulse;
+
+            if (!OriginalJumpImpulses.TryGetValue(
+                    __instance.GetInstanceID(),
+                    out originalJumpImpulse))
+            {
+                LogRejected(
+                    "Original jumpImpulse was not captured.");
+
+                return true;
+            }
+
+            if (originalJumpImpulse <= 0f)
+            {
+                LogRejected(
+                    $"Original jumpImpulse is invalid: " +
+                    $"{originalJumpImpulse:0.000}");
+
+                return true;
+            }
+
+            /*
+             * 공항과 Pal Jump는 PEAK 원본 동작을 유지합니다.
+             */
+            if (JumpingPEAK.IsAirportScene() ||
+                isPalJump)
+            {
+                LogDefaultJump(
+                    character,
+                    originalJumpImpulse,
+                    isPalJump
+                        ? "PalJump"
+                        : "Airport");
+
+                return true;
+            }
+
+            /*
+             * Falldown, Fellasleep 또는 Stand 복귀 중이면
+             * 자동 점프와 수동 점프를 모두 완전히 차단합니다.
+             */
+            string blockedReason;
+
+            if (ShouldBlockJump(
+                    character,
+                    out blockedReason))
+            {
+                RestoreOriginalJumpImpulse(
+                    __instance);
+
+                LogBlockedJump(
+                    character,
+                    "JumpRpc",
+                    blockedReason);
+
+                /*
+                 * 원본 JumpRpc도 실행하지 않습니다.
+                 *
+                 * jumpsRemaining, chargingJump, OnStartJump 및
+                 * 점프 코루틴이 전혀 실행되지 않습니다.
+                 */
+                return false;
+            }
+
+            /*
+             * 이 지점에 도달했다면 캐릭터가 Stand 상태로
+             * 충분히 안정된 것입니다.
+             */
+            bool wasGrounded =
+                character.data.isGrounded;
+
+            bool shiftHeld =
+                GetShiftHeld(
+                    character);
+
+            bool useShiftBoost =
+                wasGrounded &&
+                shiftHeld;
+
+            float selectedJumpMultiplier =
+                ControlledJumpMultiplier;
+
+            float selectedDirectionalSpeed =
+                DirectionalJumpSpeed;
+
+            if (useShiftBoost)
+            {
+                selectedJumpMultiplier *=
+                    ShiftBoostMultiplier;
+
+                selectedDirectionalSpeed *=
+                    ShiftDirectionalSpeedMultiplier;
+            }
+
+            float boostedJumpImpulse =
+                originalJumpImpulse *
+                selectedJumpMultiplier;
+
+            __instance.jumpImpulse =
+                boostedJumpImpulse;
+
+            Vector2 movementInput =
+                GetMovementInput(
+                    character);
+
+            Vector3 movementDirection =
+                CalculateMovementDirection(
+                    character,
+                    movementInput);
+
+            __state.Character =
+                character;
+
+            __state.MovementInput =
+                movementInput;
+
+            __state.MovementDirection =
+                movementDirection;
+
+            __state.DirectionalSpeed =
+                selectedDirectionalSpeed;
+
+            __state.ApplyDirectionalBoost =
+                movementDirection.sqrMagnitude >
+                0.0001f;
+
+            __state.ShiftBoosted =
+                useShiftBoost;
+
+            __state.WasGrounded =
+                wasGrounded;
+
+            if (boostedJumpLogCount <
+                MaximumLogCount)
+            {
+                boostedJumpLogCount++;
+
+                JumpingPEAK.ModLogger?.LogInfo(
+                    $"[JumpingPEAK] Standing jump applied " +
+                    $"({boostedJumpLogCount}/{MaximumLogCount}). " +
+                    $"OriginalImpulse={originalJumpImpulse:0.000}, " +
+                    $"JumpMultiplier={selectedJumpMultiplier:0.00}, " +
+                    $"BoostedImpulse={boostedJumpImpulse:0.000}, " +
+                    $"ShiftHeld={shiftHeld}, " +
+                    $"ShiftBoosted={useShiftBoost}, " +
+                    $"WasGrounded={wasGrounded}, " +
+                    $"MovementInput={movementInput}, " +
+                    $"MovementDirection={movementDirection}, " +
+                    $"DirectionalSpeed=" +
+                    $"{selectedDirectionalSpeed:0.00}, " +
+                    $"CurrentControl=" +
+                    $"{character.data.currentRagdollControll:0.000}, " +
+                    $"TargetControl=" +
+                    $"{character.data.GetTargetRagdollControll():0.000}, " +
+                    $"Scene=" +
+                    $"{SceneManager.GetActiveScene().name}");
+            }
+
+            return true;
+        }
+
+        [HarmonyPostfix]
+        private static void Postfix(
+            CharacterMovement __instance,
+            JumpPatchState __state)
+        {
+            if (__instance == null ||
+                __state == null ||
+                !__state.ApplyDirectionalBoost ||
+                __state.Character == null)
+            {
+                return;
+            }
+
+            __instance.StartCoroutine(
+                ApplyDirectionalVelocityAfterTakeoff(
+                    __state));
+        }
+
+        private static void CaptureOriginalJumpImpulse(
+            CharacterMovement movement)
+        {
+            if (movement == null)
+            {
+                return;
+            }
+
+            int movementId =
+                movement.GetInstanceID();
+
+            if (OriginalJumpImpulses.ContainsKey(
+                    movementId))
+            {
+                return;
+            }
+
+            if (movement.jumpImpulse <= 0f)
+            {
+                return;
+            }
+
+            OriginalJumpImpulses.Add(
+                movementId,
+                movement.jumpImpulse);
+        }
+
+        internal static void RestoreOriginalJumpImpulse(
+            CharacterMovement movement)
+        {
+            if (movement == null)
+            {
+                return;
+            }
+
+            /*
+             * 아직 원본값이 저장되지 않았다면
+             * 현재 값을 최초 원본값으로 저장합니다.
+             */
+            CaptureOriginalJumpImpulse(
+                movement);
+
+            float originalJumpImpulse;
+
+            if (!OriginalJumpImpulses.TryGetValue(
+                    movement.GetInstanceID(),
+                    out originalJumpImpulse))
+            {
+                return;
+            }
+
+            movement.jumpImpulse =
+                originalJumpImpulse;
+        }
+
+        private static Vector3 CalculateMovementDirection(
+            Character character,
+            Vector2 movementInput)
+        {
+            if (character == null ||
+                character.data == null ||
+                movementInput.sqrMagnitude <=
+                0.0001f)
+            {
+                return Vector3.zero;
+            }
+
+            Vector3 forward =
+                character.data.lookDirection_Flat;
+
+            forward.y =
+                0f;
+
+            if (forward.sqrMagnitude <=
+                0.0001f)
+            {
+                forward =
+                    character.data.lookDirection;
+
+                forward.y =
+                    0f;
+            }
+
+            if (forward.sqrMagnitude >
+                0.0001f)
+            {
+                forward.Normalize();
+            }
+
+            Vector3 right =
+                character.data.lookDirection_Right;
+
+            right.y =
+                0f;
+
+            if (right.sqrMagnitude <=
+                    0.0001f &&
+                forward.sqrMagnitude >
+                    0.0001f)
+            {
+                right =
+                    Vector3.Cross(
+                        Vector3.up,
+                        forward);
+            }
+
+            if (right.sqrMagnitude >
+                0.0001f)
+            {
+                right.Normalize();
+            }
+
+            Vector3 movementDirection =
+                forward *
+                movementInput.y;
+
+            movementDirection +=
+                right *
+                movementInput.x;
+
+            movementDirection.y =
+                0f;
+
+            if (movementDirection.sqrMagnitude <=
+                0.0001f)
+            {
+                return Vector3.zero;
+            }
+
+            return movementDirection.normalized;
+        }
+
+        private static IEnumerator
+            ApplyDirectionalVelocityAfterTakeoff(
+                JumpPatchState state)
+        {
+            for (int frame = 0;
+                 frame < MaximumTakeoffWaitFrames;
+                 frame++)
+            {
+                yield return WaitForPhysics;
+
+                Character character =
+                    state.Character;
+
+                if (character == null ||
+                    !character.IsLocal ||
+                    character.data == null)
+                {
+                    yield break;
+                }
+
+                if (character.data.dead ||
+                    character.data.fullyPassedOut)
+                {
+                    yield break;
+                }
+
+                bool hasTakenOff =
+                    !character.data.isGrounded &&
+                    character.data.sinceJump <
+                    0.3f;
+
+                if (!hasTakenOff)
+                {
+                    continue;
+                }
+
+                ApplyDirectionalVelocity(
+                    character,
+                    state);
+
+                yield break;
+            }
+
+            LogRejected(
+                "Directional boost timed out before takeoff.");
+        }
+
+        private static void ApplyDirectionalVelocity(
+            Character character,
+            JumpPatchState state)
+        {
+            if (character == null ||
+                character.refs == null ||
+                character.refs.ragdoll == null ||
+                character.refs.ragdoll.partList == null)
+            {
+                LogRejected(
+                    "Ragdoll bodyparts are unavailable.");
+
+                return;
+            }
+
+            if (state == null ||
+                state.MovementDirection.sqrMagnitude <=
+                0.0001f)
+            {
+                return;
+            }
+
+            Vector3 targetHorizontalVelocity =
+                state.MovementDirection *
+                state.DirectionalSpeed;
+
+            int appliedBodypartCount =
+                0;
+
+            int kinematicBodypartCount =
+                0;
+
+            int unavailableBodypartCount =
+                0;
+
+            float totalHorizontalSpeedBefore =
+                0f;
+
+            float totalHorizontalSpeedAfter =
+                0f;
+
+            for (int i = 0;
+                 i < character.refs.ragdoll.partList.Count;
+                 i++)
+            {
+                Bodypart bodypart =
+                    character.refs.ragdoll.partList[i];
+
+                if (bodypart == null ||
+                    bodypart.Rig == null)
+                {
+                    unavailableBodypartCount++;
+                    continue;
+                }
+
+                Rigidbody rigidbody =
+                    bodypart.Rig;
+
+                if (rigidbody.isKinematic)
+                {
+                    kinematicBodypartCount++;
+                    continue;
+                }
+
+                Vector3 velocity =
+                    rigidbody.linearVelocity;
+
+                Vector3 horizontalVelocityBefore =
+                    new Vector3(
+                        velocity.x,
+                        0f,
+                        velocity.z);
+
+                totalHorizontalSpeedBefore +=
+                    horizontalVelocityBefore.magnitude;
+
+                velocity.x =
+                    targetHorizontalVelocity.x;
+
+                velocity.z =
+                    targetHorizontalVelocity.z;
+
+                rigidbody.linearVelocity =
+                    velocity;
+
+                Vector3 horizontalVelocityAfter =
+                    new Vector3(
+                        rigidbody.linearVelocity.x,
+                        0f,
+                        rigidbody.linearVelocity.z);
+
+                totalHorizontalSpeedAfter +=
+                    horizontalVelocityAfter.magnitude;
+
+                appliedBodypartCount++;
+            }
+
+            float averageSpeedBefore =
+                appliedBodypartCount > 0
+                    ? totalHorizontalSpeedBefore /
+                      appliedBodypartCount
+                    : 0f;
+
+            float averageSpeedAfter =
+                appliedBodypartCount > 0
+                    ? totalHorizontalSpeedAfter /
+                      appliedBodypartCount
+                    : 0f;
+
+            if (directionalBoostLogCount <
+                MaximumLogCount)
+            {
+                directionalBoostLogCount++;
+
+                JumpingPEAK.ModLogger?.LogInfo(
+                    $"[JumpingPEAK] Directional jump applied " +
+                    $"({directionalBoostLogCount}/{MaximumLogCount}). " +
+                    $"MovementInput={state.MovementInput}, " +
+                    $"Direction={state.MovementDirection}, " +
+                    $"ShiftBoosted={state.ShiftBoosted}, " +
+                    $"WasGrounded={state.WasGrounded}, " +
+                    $"DirectionalSpeed={state.DirectionalSpeed:0.00}, " +
+                    $"TargetHorizontalVelocity=" +
+                    $"{targetHorizontalVelocity}, " +
+                    $"AverageSpeedBefore=" +
+                    $"{averageSpeedBefore:0.00}, " +
+                    $"AverageSpeedAfter=" +
+                    $"{averageSpeedAfter:0.00}, " +
+                    $"AppliedBodyparts={appliedBodypartCount}, " +
+                    $"KinematicBodyparts={kinematicBodypartCount}, " +
+                    $"UnavailableBodyparts=" +
+                    $"{unavailableBodypartCount}, " +
+                    $"Scene=" +
+                    $"{SceneManager.GetActiveScene().name}");
+            }
+        }
+
+        private static void LogDefaultJump(
+            Character character,
+            float originalJumpImpulse,
+            string reason)
+        {
+            if (defaultJumpLogCount >=
+                MaximumLogCount)
+            {
+                return;
+            }
+
+            defaultJumpLogCount++;
+
+            JumpingPEAK.ModLogger?.LogInfo(
+                $"[JumpingPEAK] Default jump used " +
+                $"({defaultJumpLogCount}/{MaximumLogCount}). " +
+                $"Reason={reason}, " +
+                $"Impulse={originalJumpImpulse:0.000}, " +
+                $"CurrentControl=" +
+                $"{character.data.currentRagdollControll:0.000}, " +
+                $"Scene=" +
+                $"{SceneManager.GetActiveScene().name}");
+        }
+
+        private static void LogRejected(
+            string reason)
+        {
+            if (rejectedLogCount >=
+                MaximumLogCount)
+            {
+                return;
+            }
+
+            rejectedLogCount++;
+
+            JumpingPEAK.ModLogger?.LogWarning(
+                $"[JumpingPEAK] Jump modification rejected " +
+                $"({rejectedLogCount}/{MaximumLogCount}): " +
+                reason);
+        }
+
+        internal static void ClearCache()
+        {
+            OriginalJumpImpulses.Clear();
+
+            boostedJumpLogCount = 0;
+            directionalBoostLogCount = 0;
+            defaultJumpLogCount = 0;
+            rejectedLogCount = 0;
+        }
+    }
+}
