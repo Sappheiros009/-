@@ -1,0 +1,787 @@
+using BepInEx;
+using BepInEx.Logging;
+using HarmonyLib;
+using System;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+[BepInPlugin(PluginGUID, PluginName, PluginVersion)]
+public sealed class JumpSound : BaseUnityPlugin
+{
+    public const string PluginGUID =
+        "Sapphire009.JumpSound";
+
+    public const string PluginName =
+        "JumpSound";
+
+    public const string PluginVersion =
+        "1.0.0";
+
+    private const string BuildMarker =
+        "BounceShroomJumpSound-R1";
+
+    /*
+     * 방방균류 사운드를 찾지 못했을 때
+     * 다시 검색하는 간격입니다.
+     */
+    private const float SoundSearchInterval =
+        1f;
+
+    private const int MinimumSoundScore =
+        80;
+
+    private const int MaximumLogCount =
+        30;
+
+    internal static ManualLogSource ModLogger;
+
+    /*
+     * 원본 방방균류가 사용하는 SFX_Instance입니다.
+     */
+    private static SFX_Instance sourceBounceSound;
+
+    /*
+     * 원본 방방균류 사운드와 재생 쿨타임이 충돌하지 않도록
+     * 점프 전용으로 복제한 SFX_Instance입니다.
+     */
+    private static SFX_Instance runtimeJumpSound;
+
+    private static float nextSoundSearchTime;
+
+    private static int soundFoundLogCount;
+    private static int soundPlayedLogCount;
+    private static int soundMissingLogCount;
+
+    private Harmony harmony;
+
+    private void Awake()
+    {
+        ModLogger =
+            Logger;
+
+        harmony =
+            new Harmony(PluginGUID);
+
+        harmony.PatchAll();
+
+        SceneManager.sceneLoaded +=
+            OnSceneLoaded;
+
+        TryFindBounceShroomSound();
+
+        Logger.LogInfo(
+            $"{PluginName} {PluginVersion} loaded. " +
+            $"Build: {BuildMarker}. " +
+            "Successful character jumps will use the " +
+            "PEAK bounce-shroom sound.");
+    }
+
+    private void Update()
+    {
+        if (runtimeJumpSound != null)
+        {
+            return;
+        }
+
+        if (Time.unscaledTime <
+            nextSoundSearchTime)
+        {
+            return;
+        }
+
+        nextSoundSearchTime =
+            Time.unscaledTime +
+            SoundSearchInterval;
+
+        TryFindBounceShroomSound();
+    }
+
+    private void OnDestroy()
+    {
+        SceneManager.sceneLoaded -=
+            OnSceneLoaded;
+
+        DestroyRuntimeSound();
+
+        sourceBounceSound =
+            null;
+
+        soundFoundLogCount =
+            0;
+
+        soundPlayedLogCount =
+            0;
+
+        soundMissingLogCount =
+            0;
+
+        if (harmony != null)
+        {
+            harmony.UnpatchSelf();
+            harmony = null;
+        }
+
+        ModLogger =
+            null;
+    }
+
+    private static void OnSceneLoaded(
+        Scene scene,
+        LoadSceneMode loadSceneMode)
+    {
+        nextSoundSearchTime =
+            0f;
+
+        /*
+         * 이전 씬에서 사운드를 찾지 못했으면
+         * 새 씬의 방방균류 오브젝트를 다시 검색합니다.
+         */
+        if (runtimeJumpSound == null)
+        {
+            TryFindBounceShroomSound();
+        }
+    }
+
+    internal static bool IsAirportScene()
+    {
+        string sceneName =
+            SceneManager.GetActiveScene().name;
+
+        if (string.IsNullOrEmpty(
+                sceneName))
+        {
+            return false;
+        }
+
+        return sceneName.IndexOf(
+                   "Airport",
+                   StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static Character ResolveCharacter(
+        Component component)
+    {
+        if (component == null)
+        {
+            return null;
+        }
+
+        Character character =
+            component.GetComponent<Character>();
+
+        if (character == null)
+        {
+            character =
+                component.GetComponentInParent<Character>();
+        }
+
+        return character;
+    }
+
+    /*
+     * 먼저 실제 CollisionModifier 오브젝트에서
+     * BounceShroom의 bounceSFX를 찾습니다.
+     *
+     * 방방균류는 CollisionModifier의 bounceSFX를
+     * 충돌 지점에서 재생하는 구조입니다.
+     */
+    private static bool TryFindBounceShroomSound()
+    {
+        if (IsValidSound(
+                runtimeJumpSound))
+        {
+            return true;
+        }
+
+        SFX_Instance selectedSound =
+            null;
+
+        string selectedSource =
+            string.Empty;
+
+        int selectedScore =
+            int.MinValue;
+
+        CollisionModifier[] modifiers =
+            Resources.FindObjectsOfTypeAll<
+                CollisionModifier>();
+
+        if (modifiers != null)
+        {
+            for (int i = 0;
+                 i < modifiers.Length;
+                 i++)
+            {
+                CollisionModifier modifier =
+                    modifiers[i];
+
+                if (modifier == null ||
+                    !IsValidSound(
+                        modifier.bounceSFX))
+                {
+                    continue;
+                }
+
+                string hierarchyText =
+                    GetHierarchyText(
+                        modifier.transform);
+
+                string soundText =
+                    GetSoundText(
+                        modifier.bounceSFX);
+
+                int score =
+                    ScoreBounceShroomText(
+                        hierarchyText);
+
+                score +=
+                    ScoreBounceShroomText(
+                        soundText);
+
+                /*
+                 * 실제로 튕기는 CollisionModifier를 우선합니다.
+                 */
+                if (modifier.knockback > 0f)
+                {
+                    score +=
+                        10;
+                }
+
+                if (score <=
+                    selectedScore)
+                {
+                    continue;
+                }
+
+                selectedScore =
+                    score;
+
+                selectedSound =
+                    modifier.bounceSFX;
+
+                selectedSource =
+                    hierarchyText;
+            }
+        }
+
+        /*
+         * 현재 씬에서 방방균류 CollisionModifier를 찾지 못하면
+         * 로드된 SFX_Instance 에셋 이름과 AudioClip 이름을
+         * 직접 검사합니다.
+         */
+        if (selectedSound == null ||
+            selectedScore <
+            MinimumSoundScore)
+        {
+            SFX_Instance[] sounds =
+                Resources.FindObjectsOfTypeAll<
+                    SFX_Instance>();
+
+            if (sounds != null)
+            {
+                for (int i = 0;
+                     i < sounds.Length;
+                     i++)
+                {
+                    SFX_Instance sound =
+                        sounds[i];
+
+                    if (!IsValidSound(
+                            sound))
+                    {
+                        continue;
+                    }
+
+                    string soundText =
+                        GetSoundText(
+                            sound);
+
+                    int score =
+                        ScoreBounceShroomText(
+                            soundText);
+
+                    if (score <=
+                        selectedScore)
+                    {
+                        continue;
+                    }
+
+                    selectedScore =
+                        score;
+
+                    selectedSound =
+                        sound;
+
+                    selectedSource =
+                        soundText;
+                }
+            }
+        }
+
+        if (selectedSound == null ||
+            selectedScore <
+            MinimumSoundScore)
+        {
+            if (soundMissingLogCount <
+                MaximumLogCount)
+            {
+                soundMissingLogCount++;
+
+                ModLogger?.LogWarning(
+                    $"[JumpSound] Bounce-shroom sound not found " +
+                    $"({soundMissingLogCount}/{MaximumLogCount}). " +
+                    $"BestScore={selectedScore}, " +
+                    $"BestCandidate={selectedSource}, " +
+                    $"Scene=" +
+                    $"{SceneManager.GetActiveScene().name}");
+            }
+
+            return false;
+        }
+
+        SetBounceShroomSound(
+            selectedSound,
+            selectedSource,
+            selectedScore);
+
+        return runtimeJumpSound != null;
+    }
+
+    private static void SetBounceShroomSound(
+        SFX_Instance sound,
+        string source,
+        int score)
+    {
+        if (!IsValidSound(sound))
+        {
+            return;
+        }
+
+        if (sourceBounceSound ==
+                sound &&
+            IsValidSound(
+                runtimeJumpSound))
+        {
+            return;
+        }
+
+        DestroyRuntimeSound();
+
+        sourceBounceSound =
+            sound;
+
+        /*
+         * 원본 방방균류의 재생 시간 및 cooldown 상태와
+         * 일반 점프 사운드가 서로 영향을 주지 않도록 복제합니다.
+         */
+        runtimeJumpSound =
+            UnityEngine.Object.Instantiate<
+                SFX_Instance>(
+                sourceBounceSound);
+
+        if (runtimeJumpSound == null)
+        {
+            return;
+        }
+
+        runtimeJumpSound.name =
+            "Sapphire009_JumpSound_BounceShroom";
+
+        runtimeJumpSound.hideFlags =
+            HideFlags.HideAndDontSave;
+
+        if (soundFoundLogCount <
+            MaximumLogCount)
+        {
+            soundFoundLogCount++;
+
+            ModLogger?.LogInfo(
+                $"[JumpSound] Bounce-shroom sound selected " +
+                $"({soundFoundLogCount}/{MaximumLogCount}). " +
+                $"SFX={sourceBounceSound.name}, " +
+                $"Score={score}, " +
+                $"Source={source}, " +
+                $"ClipCount=" +
+                $"{sourceBounceSound.clips.Length}, " +
+                $"Scene=" +
+                $"{SceneManager.GetActiveScene().name}");
+        }
+    }
+
+    private static void DestroyRuntimeSound()
+    {
+        if (runtimeJumpSound != null)
+        {
+            UnityEngine.Object.Destroy(
+                runtimeJumpSound);
+
+            runtimeJumpSound =
+                null;
+        }
+    }
+
+    private static bool IsValidSound(
+        SFX_Instance sound)
+    {
+        return
+            sound != null &&
+            sound.clips != null &&
+            sound.clips.Length > 0;
+    }
+
+    private static string GetHierarchyText(
+        Transform transform)
+    {
+        if (transform == null)
+        {
+            return string.Empty;
+        }
+
+        string result =
+            string.Empty;
+
+        Transform current =
+            transform;
+
+        int depth =
+            0;
+
+        while (current != null &&
+               depth < 8)
+        {
+            if (!string.IsNullOrEmpty(
+                    result))
+            {
+                result =
+                    current.name +
+                    "/" +
+                    result;
+            }
+            else
+            {
+                result =
+                    current.name;
+            }
+
+            current =
+                current.parent;
+
+            depth++;
+        }
+
+        return result;
+    }
+
+    private static string GetSoundText(
+        SFX_Instance sound)
+    {
+        if (sound == null)
+        {
+            return string.Empty;
+        }
+
+        string result =
+            sound.name;
+
+        if (sound.clips == null)
+        {
+            return result;
+        }
+
+        for (int i = 0;
+             i < sound.clips.Length;
+             i++)
+        {
+            AudioClip clip =
+                sound.clips[i];
+
+            if (clip == null)
+            {
+                continue;
+            }
+
+            result +=
+                "/" +
+                clip.name;
+        }
+
+        return result;
+    }
+
+    private static int ScoreBounceShroomText(
+        string text)
+    {
+        if (string.IsNullOrEmpty(
+                text))
+        {
+            return 0;
+        }
+
+        string lowerText =
+            text.ToLowerInvariant();
+
+        int score =
+            0;
+
+        if (Contains(
+                lowerText,
+                "bounceshroom"))
+        {
+            score +=
+                200;
+        }
+
+        if (Contains(
+                lowerText,
+                "bounce shroom"))
+        {
+            score +=
+                200;
+        }
+
+        if (Contains(
+                lowerText,
+                "bounce_shroom"))
+        {
+            score +=
+                200;
+        }
+
+        if (Contains(
+                lowerText,
+                "shroombounce"))
+        {
+            score +=
+                180;
+        }
+
+        if (Contains(
+                lowerText,
+                "shroom bounce"))
+        {
+            score +=
+                180;
+        }
+
+        if (Contains(
+                lowerText,
+                "mushroom bounce"))
+        {
+            score +=
+                170;
+        }
+
+        if (Contains(
+                lowerText,
+                "bounce mushroom"))
+        {
+            score +=
+                170;
+        }
+
+        if (Contains(
+                lowerText,
+                "bounce"))
+        {
+            score +=
+                25;
+        }
+
+        if (Contains(
+                lowerText,
+                "shroom"))
+        {
+            score +=
+                80;
+        }
+
+        if (Contains(
+                lowerText,
+                "mushroom"))
+        {
+            score +=
+                70;
+        }
+
+        if (Contains(
+                lowerText,
+                "fungus"))
+        {
+            score +=
+                50;
+        }
+
+        return score;
+    }
+
+    private static bool Contains(
+        string source,
+        string value)
+    {
+        return source.IndexOf(
+                   value,
+                   StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static void PlayJumpSound(
+        Character character)
+    {
+        if (character == null ||
+            IsAirportScene())
+        {
+            return;
+        }
+
+        if (!IsValidSound(
+                runtimeJumpSound))
+        {
+            TryFindBounceShroomSound();
+        }
+
+        if (!IsValidSound(
+                runtimeJumpSound) ||
+            SFX_Player.instance == null)
+        {
+            return;
+        }
+
+        /*
+         * 각 클라이언트의 JumpRpc에서 재생되므로
+         * 다른 플레이어의 점프도 해당 캐릭터 위치에서 들립니다.
+         */
+        SFX_Player.instance.PlaySFX(
+            runtimeJumpSound,
+            character.Center,
+            null,
+            null,
+            1f,
+            false);
+
+        if (soundPlayedLogCount <
+            MaximumLogCount)
+        {
+            soundPlayedLogCount++;
+
+            ModLogger?.LogInfo(
+                $"[JumpSound] Bounce-shroom jump sound played " +
+                $"({soundPlayedLogCount}/{MaximumLogCount}). " +
+                $"Character={character.name}, " +
+                $"Position={character.Center}, " +
+                $"Scene=" +
+                $"{SceneManager.GetActiveScene().name}");
+        }
+    }
+
+    /*
+     * PEAK의 TryToJump는 점프 조건을 통과하면
+     * JumpRpc(false)를 호출합니다.
+     *
+     * JumpRpc가 실제로 점프 횟수를 감소시키고
+     * chargingJump를 true로 변경하므로,
+     * 이 지점에서 성공한 점프만 판별해 사운드를 재생합니다.
+     */
+    [HarmonyPatch(
+        typeof(CharacterMovement),
+        nameof(CharacterMovement.JumpRpc),
+        new Type[]
+        {
+            typeof(bool)
+        })]
+    private static class CharacterMovementJumpRpcPatch
+    {
+        private sealed class JumpSoundState
+        {
+            public Character Character;
+
+            public int JumpsRemainingBefore;
+
+            public bool ChargingJumpBefore;
+
+            public bool IsPalJump;
+
+            public bool Valid;
+        }
+
+        [HarmonyPrefix]
+        [HarmonyPriority(Priority.First)]
+        [HarmonyBefore(
+            new string[]
+            {
+                "Sapphire009.JumpingPEAK",
+                "Sapphire009.BeforeStart"
+            })]
+        private static void Prefix(
+            CharacterMovement __instance,
+            bool __0,
+            out JumpSoundState __state)
+        {
+            __state =
+                new JumpSoundState();
+
+            Character character =
+                ResolveCharacter(
+                    __instance);
+
+            if (character == null ||
+                character.data == null)
+            {
+                return;
+            }
+
+            __state.Character =
+                character;
+
+            __state.JumpsRemainingBefore =
+                character.data.jumpsRemaining;
+
+            __state.ChargingJumpBefore =
+                character.data.chargingJump;
+
+            __state.IsPalJump =
+                __0;
+
+            __state.Valid =
+                true;
+        }
+
+        [HarmonyPostfix]
+        [HarmonyPriority(Priority.Last)]
+        private static void Postfix(
+            JumpSoundState __state)
+        {
+            if (__state == null ||
+                !__state.Valid ||
+                __state.IsPalJump ||
+                __state.Character == null ||
+                __state.Character.data == null)
+            {
+                return;
+            }
+
+            Character character =
+                __state.Character;
+
+            /*
+             * JumpingPEAK나 BeforeStart에서 JumpRpc를 차단했다면
+             * 점프 횟수와 chargingJump가 변하지 않으므로
+             * 사운드도 재생되지 않습니다.
+             */
+            bool jumpsDecreased =
+                character.data.jumpsRemaining <
+                __state.JumpsRemainingBefore;
+
+            bool chargingStarted =
+                !__state.ChargingJumpBefore &&
+                character.data.chargingJump;
+
+            if (!jumpsDecreased &&
+                !chargingStarted)
+            {
+                return;
+            }
+
+            PlayJumpSound(
+                character);
+        }
+    }
+}
