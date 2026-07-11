@@ -23,7 +23,7 @@ public sealed class Runup : BaseUnityPlugin
         "1.0.0";
 
     private const string BuildMarker =
-        "PalJump-AboveJumpingPEAK-R1";
+        "PalJump-AboveJumpingPEAK-R2";
 
     /*
      * 현재 JumpingPEAK의 일반 강화 점프:
@@ -34,28 +34,35 @@ public sealed class Runup : BaseUnityPlugin
         5f;
 
     /*
-     * 협동 점프를 JumpingPEAK 일반 강화 점프보다
-     * 1.25배 강하게 설정합니다.
+     * 기존 Runup 협동 점프는
+     * JumpingPEAK 일반 점프보다 1.25배 강했습니다.
      *
-     * 최종 목표:
-     * 원본 × 5 × 1.25 = 원본 × 6.25
+     * 기존 최종 배율:
+     * 원본 × 5 × 1.25
+     * = 원본 × 6.25
+     *
+     * 이번 수정에서는 기존 Runup 점프보다
+     * 정확히 10배 강하게 설정합니다.
+     *
+     * 원본 × 5 × 12.5
+     * = 원본 × 62.5
      */
     private const float RunupRelativeMultiplier =
-        1.25f;
+        12.5f;
 
     /*
-     * PEAK 원본 Pal Jump에는 이미 내부적으로
+     * PEAK 원본 Pal Jump에는 내부적으로
      * jumpMult = 2가 적용됩니다.
      */
     private const float NativePalJumpMultiplier =
         2f;
 
     /*
-     * 최종 협동 점프를 원본 ×6.25로 만들기 위한
+     * 최종 협동 점프를 원본 ×62.5로 만들기 위한
      * 실제 jumpImpulse 배율입니다.
      *
-     * 3.125 × PEAK 내부 Pal Jump 2배
-     * = 최종 6.25배
+     * 31.25 × PEAK 내부 Pal Jump 2배
+     * = 최종 원본 대비 62.5배
      */
     private const float RunupImpulseMultiplier =
         (
@@ -121,8 +128,8 @@ public sealed class Runup : BaseUnityPlugin
             $"{RunupImpulseMultiplier:0.000}. " +
             $"Final effective multiplier=" +
             $"{FinalEffectiveMultiplier:0.000}. " +
-            "Pal Jump is 1.25x stronger than " +
-            "JumpingPEAK's normal boosted jump.");
+            "Pal Jump is now 10x stronger than " +
+            "the previous Runup Pal Jump.");
     }
 
     private void OnDestroy()
@@ -662,7 +669,7 @@ public sealed class Runup : BaseUnityPlugin
 
             /*
              * PEAK 내부 Pal Jump 2배가 이후 추가되므로
-             * 최종 수직 계수는 원본의 6.25배가 됩니다.
+             * 최종 수직 계수는 원본의 62.5배가 됩니다.
              */
             __instance.jumpImpulse =
                 runupJumpImpulse;
