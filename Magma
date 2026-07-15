@@ -1,0 +1,190 @@
+using HarmonyLib;
+using Photon.Pun;
+using System;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using Zorro.Core;
+
+/*
+ * JumpingPEAK - Magma
+ * Developer: Sapphire009
+ *
+ * StaminaFull의 상태이상 차단은 그대로 유지합니다.
+ * PEAK 원본 Lava.HitPlayer가 실행되는 순간을 감지하여
+ * 현재 구간이 Caldera 또는 TheKiln일 때만 로컬 플레이어를 즉사시킵니다.
+ */
+[HarmonyPatch(
+    typeof(Lava),
+    "HitPlayer",
+    new Type[]
+    {
+        typeof(Character)
+    })]
+internal static class Magma
+{
+    internal const string DeveloperName =
+        "Sapphire009";
+
+    private const int MaximumLogCount = 20;
+
+    private static int instantDeathLogCount;
+    private static int rejectedLogCount;
+
+    [HarmonyPrefix]
+    [HarmonyPriority(Priority.First)]
+    private static bool Prefix(
+        Lava __instance,
+        Character __0)
+    {
+        Character character =
+            __0;
+
+        /*
+         * PEAK 원본 Lava.HitPlayer는 로컬 캐릭터를 대상으로 호출됩니다.
+         * 원격 캐릭터나 초기화되지 않은 캐릭터는 원본 동작을 유지합니다.
+         */
+        if (character == null ||
+            !character.IsLocal ||
+            character.data == null)
+        {
+            return true;
+        }
+
+        /*
+         * 이미 사망한 캐릭터에게 상태이상이 다시 들어가지 않도록
+         * 원본 HitPlayer도 실행하지 않습니다.
+         */
+        if (character.data.dead)
+        {
+            return false;
+        }
+
+        Segment currentSegment;
+
+        if (!TryGetCurrentSegment(
+                out currentSegment))
+        {
+            LogRejected(
+                __instance,
+                "MapHandler is unavailable.");
+
+            return true;
+        }
+
+        /*
+         * 칼데라와 가마 이외의 구간에서는
+         * Magma가 아무것도 변경하지 않습니다.
+         */
+        if (currentSegment != Segment.Caldera &&
+            currentSegment != Segment.TheKiln)
+        {
+            return true;
+        }
+
+        if (character.refs == null ||
+            character.refs.view == null)
+        {
+            LogRejected(
+                __instance,
+                "Character PhotonView is unavailable.");
+
+            return true;
+        }
+
+        Vector3 deathPosition =
+            character.Center;
+
+        /*
+         * 상태이상 수치를 올리지 않고 PEAK 원본 사망 RPC를 직접 호출합니다.
+         * RpcTarget.All을 사용하므로 호스트와 참가자 화면에 동일하게
+         * 사망 상태, 아이템 드롭, 관전 위치 및 종료 판정이 적용됩니다.
+         */
+        character.refs.view.RPC(
+            nameof(Character.RPCA_Die),
+            RpcTarget.All,
+            new object[]
+            {
+                deathPosition
+            });
+
+        LogInstantDeath(
+            __instance,
+            currentSegment,
+            deathPosition);
+
+        /*
+         * 원본 HitPlayer의 Injury 및 Hot 상태 추가를 실행하지 않습니다.
+         */
+        return false;
+    }
+
+    private static bool TryGetCurrentSegment(
+        out Segment currentSegment)
+    {
+        currentSegment =
+            default(Segment);
+
+        if (Singleton<MapHandler>.Instance == null)
+        {
+            return false;
+        }
+
+        currentSegment =
+            MapHandler.CurrentSegmentNumber;
+
+        return true;
+    }
+
+    private static void LogInstantDeath(
+        Lava lava,
+        Segment segment,
+        Vector3 deathPosition)
+    {
+        if (instantDeathLogCount >=
+            MaximumLogCount)
+        {
+            return;
+        }
+
+        instantDeathLogCount++;
+
+        string lavaName =
+            lava != null
+                ? lava.gameObject.name
+                : "Unknown";
+
+        JumpingPEAK.ModLogger?.LogInfo(
+            $"[Magma] Lava instant death applied " +
+            $"({instantDeathLogCount}/{MaximumLogCount}). " +
+            $"Developer={DeveloperName}, " +
+            $"Segment={segment}, " +
+            $"Lava={lavaName}, " +
+            $"Position={deathPosition}, " +
+            $"Scene={SceneManager.GetActiveScene().name}");
+    }
+
+    private static void LogRejected(
+        Lava lava,
+        string reason)
+    {
+        if (rejectedLogCount >=
+            MaximumLogCount)
+        {
+            return;
+        }
+
+        rejectedLogCount++;
+
+        string lavaName =
+            lava != null
+                ? lava.gameObject.name
+                : "Unknown";
+
+        JumpingPEAK.ModLogger?.LogWarning(
+            $"[Magma] Lava instant death rejected " +
+            $"({rejectedLogCount}/{MaximumLogCount}). " +
+            $"Reason={reason}, " +
+            $"Lava={lavaName}, " +
+            $"Scene={SceneManager.GetActiveScene().name}");
+    }
+}
